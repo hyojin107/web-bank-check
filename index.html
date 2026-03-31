@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>셔틀러 모임비 납부 확인</title>
+    <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<div class="page">
+    <div class="card">
+        <h1 class="title">셔틀러 모임비 납부 확인</h1>
+        <p class="description">
+            업로드한 거래내역서 PDF 또는 엑셀 파일을 기준으로 모임원 입금 상태를 확인합니다.
+        </p>
+
+        <div class="section">
+            <label class="label" for="fileInput">파일 선택</label>
+            <input type="file" id="fileInput" accept=".pdf,.xlsx,.xls,application/pdf" />
+        </div>
+
+        <div class="section">
+            <label class="label" for="passwordInput">PDF 암호</label>
+            <input type="password" id="passwordInput" placeholder="PDF 암호 입력 (암호 없는 파일은 비워두기)" />
+            <div class="hint">
+                PDF 암호가 없는 파일이나 일반 엑셀 파일은 비워둔 채 확인을 눌러주세요.<br>
+                모임원 명단은 Google 스프레드시트에서 불러옵니다.
+            </div>
+        </div>
+
+        <div class="button-row">
+            <button id="checkButton" type="button" class="btn-primary">확인</button>
+            <button id="openMembersSheetButton" type="button" class="btn-secondary">명단 시트 열기</button>
+        </div>
+
+        <div id="errorMessage" class="error"></div>
+        <div id="loadingMessage" class="loading"></div>
+        <div id="result" class="result"></div>
+    </div>
+</div>
+
+<script type="module">
+    import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs";
+    import * as XLSX from "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/+esm";
+
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs";
+
+    const REQUIRED_AMOUNT = 3000;
+
+    const GOOGLE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1zM0YXF1m2BNstvqbMTLd_awM19-dKOX4DlAympxJayg/export?format=csv&gid=0";
+    const GOOGLE_SHEET_VIEW_URL = "https://docs.google.com/spreadsheets/d/1zM0YXF1m2BNstvqbMTLd_awM19-dKOX4DlAympxJayg/edit#gid=0";
+
+    const fileInput = document.getElementById("fileInput");
+    const passwordInput = document.getElementById("passwordInput");
+    const checkButton = document.getElementById("checkButton");
+    const openMembersSheetButton = document.getElementById("openMembersSheetButton");
+    const errorMessageDiv = document.getElementById("errorMessage");
+    const loadingMessageDiv = document.getElementById("loadingMessage");
+    const resultDiv = document.getElementById("result");
+
+    openMembersSheetButton.addEventListener("click", () => {
+        clearMessages();
+
+        if (!GOOGLE_SHEET_VIEW_URL || GOOGLE_SHEET_VIEW_URL.includes("여기에_")) {
+            showError("Google 스프레드시트 보기 URL이 설정되지 않았습니다.");
+            return;
+        }
+
+        window.open(GOOGLE_SHEET_VIEW_URL, "_blank", "noopener,noreferrer");
+    });
+
+    checkButton.addEventListener("click", async () => {
+        clearMessages();
+
+        const file = fileInput.files[0];
+        const password = passwordInput.value ?? "";
+
+        if (!file) {
+            showError("파일을 선택해주세요.");
+            return;
+        }
+
+        try {
+            showLoading("모임원 목록을 불러오는 중입니다...");
+            const expectedNames = await loadExpectedNamesFromGoogleSheet();
+
+            if (expectedNames.length === 0) {
+                throw new Error("Google 스프레드시트에 모임원 이름이 없습니다.");
+            }
+
+            showLoading("파일을 분석하는 중입니다...");
+            const records = await readRecordsFromFile(file, password);
+            const result = analyze(records, expectedNames);
+
+            showLoading("");
+            resultDiv.innerHTML =
+                renderSummary(records.length, expectedNames.length) +
+                renderOrderedList("미입금자", result.notDeposited) +
+                renderOrderedList("셔틀러 명단에 없는데 입금한 입금자", result.unexpectedDepositors) +
+                renderWrongAmountList(result.wrongAmount) +
+                renderOrderedList("중복 입금자", result.duplicateDepositors);
+
+        } catch (error) {
+            console.error(error);
+            showLoading("");
+            showError(error?.message || "파일 처리 중 오류가 발생했습니다.");
+        }
+    });
+
+    async function loadExpectedNamesFromGoogleSheet() {
+        if (!GOOGLE_SHEET_CSV_URL || GOOGLE_SHEET_CSV_URL.includes("여기에_")) {
+            throw new Error("Google 스프레드시트 CSV URL이 설정되지 않았습니다.");
+        }
+
+        const response = await fetch(GOOGLE_SHEET_CSV_URL, {
+            method: "GET",
+            cache: "no-store"
+        });
+
+        if (!response.ok) {
+            throw new Error("Google 스프레드시트에서 모임원 목록을 불러올 수 없습니다.");
+        }
+
+        const csvText = await response.text();
+        return parseExpectedNamesCsv(csvText);
+    }
+
+    function parseExpectedNamesCsv(csvText) {
+        const workbook = XLSX.read(csvText, { type: "string" });
+        const firstSheetName = workbook.SheetNames[0];
+
+        if (!firstSheetName) {
+            return [];
+        }
+
+        const sheet = workbook.Sheets[firstSheetName];
+        const rows = XLSX.utils.sheet_to_json(sheet, {
+            header: 1,
+            defval: "",
+            raw: false
+        });
+
+        if (!rows || rows.length === 0) {
+            return [];
+        }
+
+        const names = rows
+            .map(row => Array.isArray(row) ? String(row[0] ?? "").trim() : "")
+            .filter(value => value.length > 0)
+            .filter(value => value !== "이름");
+
+        return [...new Set(names)];
+    }
+
+    async function readRecordsFromFile(file, password) {
+        const lowerName = file.name.toLowerCase();
+
+        if (lowerName.endsWith(".pdf")) {
+            return await readPdfRecords(file, password);
+        }
+
+        if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls")) {
+            return await readExcelRecords(file);
+        }
+
+        throw new Error("PDF 또는 Excel 파일만 업로드할 수 있습니다.");
+    }
+
+    async function readPdfRecords(file, password) {
+        const arrayBuffer = await file.arrayBuffer();
+        const lines = await extractPdfText(arrayBuffer, password);
+        return buildDepositRecordsFromPdf(lines);
+    }
+
+    async function extractPdfText(arrayBuffer, password) {
+        const loadingTask = pdfjsLib.getDocument({
+            data: arrayBuffer,
+            password: password || undefined
+        });
+
+        try {
+            const pdf = await loadingTask.promise;
+            const lines = [];
+
+            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const textContent = await page.getTextContent();
+
+                const rows = new Map();
+
+                for (const item of textContent.items) {
+                    const text = normalizeWhitespace(item.str || "");
+                    if (!text) {
+                        continue;
+                    }
+
+                    const y = Math.round(item.transform[5]);
+                    if (!rows.has(y)) {
+                        rows.set(y, []);
+                    }
+
+                    rows.get(y).push({
+                        x: item.transform[4],
+                        text
+                    });
+                }
+
+                const pageLines = [...rows.entries()]
+                    .sort((a, b) => b[0] - a[0])
+                    .map(([, items]) =>
+                        items
+                            .sort((a, b) => a.x - b.x)
+                            .map(v => v.text)
+                            .join(" ")
+                    );
+
+                lines.push(...pageLines);
+            }
+
+            return lines;
+        } catch (error) {
+            if (error?.name === "PasswordException") {
+                if (!password) {
+                    throw new Error("암호가 있는 PDF 파일입니다. PDF 암호를 입력해주세요.");
+                }
+                throw new Error("PDF 암호가 올바르지 않습니다.");
+            }
+
+            throw new Error("PDF 파일을 읽는 중 오류가 발생했습니다.");
+        }
+    }
+
+    function buildDepositRecordsFromPdf(lines) {
+        const mergedLines = mergeWrappedLines(lines);
+        const records = [];
+
+        for (const line of mergedLines) {
+            const tx = parsePdfTransactionLine(line);
+            if (!tx) {
+                continue;
+            }
+
+            if (tx.type !== "입금") {
+                continue;
+            }
+
+            const name = tx.description.trim();
+            if (!name) {
+                continue;
+            }
+
+            records.push({
+                name,
+                amount: tx.amount,
+                dateTime: tx.dateTime
+            });
+        }
+
+        return records;
+    }
+
+    function parsePdfTransactionLine(line) {
+        const regex = /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+([-\d,]+)\s+([-\d,]+)\s+(.+)$/;
+        const match = line.match(regex);
+
+        if (!match) {
+            return null;
+        }
+
+        return {
+            dateTime: match[1],
+            type: match[2],
+            amount: parseAmount(match[3]),
+            balance: parseAmount(match[4]),
+            description: match[5].trim()
+        };
+    }
+
+    async function readExcelRecords(file) {
+        const arrayBuffer = await file.arrayBuffer();
+
+        try {
+            const workbook = XLSX.read(arrayBuffer, { type: "array" });
+            return buildDepositRecordsFromWorkbook(workbook);
+        } catch (error) {
+            throw new Error("엑셀 파일을 읽을 수 없습니다. 암호화된 엑셀은 지원하지 않습니다.");
+        }
+    }
+
+    function buildDepositRecordsFromWorkbook(workbook) {
+        const firstSheetName = workbook.SheetNames[0];
+        if (!firstSheetName) {
+            return [];
+        }
+
+        const sheet = workbook.Sheets[firstSheetName];
+        const rows = XLSX.utils.sheet_to_json(sheet, {
+            defval: "",
+            raw: false
+        });
+
+        const records = [];
+
+        for (const row of rows) {
+            const type = String(row["거래 유형"] ?? "").trim();
+            if (type !== "입금") {
+                continue;
+            }
+
+            const name = String(row["적요"] ?? "").trim();
+            const amountText = String(row["거래 금액"] ?? "").trim();
+
+            if (!name || !amountText) {
+                continue;
+            }
+
+            records.push({
+                name,
+                amount: parseAmount(amountText)
+            });
+        }
+
+        return records;
+    }
+
+    function analyze(records, expectedNames) {
+        const grouped = new Map();
+
+        for (const record of records) {
+            if (!grouped.has(record.name)) {
+                grouped.set(record.name, []);
+            }
+            grouped.get(record.name).push(record);
+        }
+
+        const depositedNames = new Set(grouped.keys());
+
+        const notDeposited = expectedNames.filter(name => !depositedNames.has(name));
+
+        const unexpectedDepositors = [...depositedNames]
+            .filter(name => !expectedNames.includes(name));
+
+        const wrongAmount = records
+            .filter(record => record.amount !== REQUIRED_AMOUNT)
+            .map(record => ({
+                name: record.name,
+                amount: record.amount
+            }));
+
+        const duplicateDepositors = [...grouped.entries()]
+            .filter(([, list]) => list.length > 1)
+            .map(([name]) => name);
+
+        return {
+            notDeposited,
+            unexpectedDepositors,
+            wrongAmount,
+            duplicateDepositors
+        };
+    }
+
+    function renderSummary(totalDeposits, expectedCount) {
+        return `
+      <div class="summary">
+        총 입금 건수: ${totalDeposits}건<br>
+        모임원 대상 인원: ${expectedCount}명
+      </div>
+    `;
+    }
+
+    function renderOrderedList(title, items) {
+        let html = `
+      <section class="result-section">
+        <h3>${escapeHtml(title)}</h3>
+    `;
+
+        if (!items || items.length === 0) {
+            html += '<div class="empty">없음</div></section>';
+            return html;
+        }
+
+        html += "<ol>";
+        for (const item of items) {
+            html += `<li>${escapeHtml(item)}</li>`;
+        }
+        html += "</ol></section>";
+
+        return html;
+    }
+
+    function renderWrongAmountList(items) {
+        let html = `
+      <section class="result-section">
+        <h3>3천원이 아닌 입금 내역</h3>
+    `;
+
+        if (!items || items.length === 0) {
+            html += '<div class="empty">없음</div></section>';
+            return html;
+        }
+
+        html += "<ul>";
+        for (const item of items) {
+            html += `<li>${escapeHtml(item.name)} - ${Number(item.amount).toLocaleString()}원</li>`;
+        }
+        html += "</ul></section>";
+
+        return html;
+    }
+
+    function clearMessages() {
+        errorMessageDiv.textContent = "";
+        loadingMessageDiv.textContent = "";
+        resultDiv.innerHTML = "";
+    }
+
+    function showError(message) {
+        errorMessageDiv.textContent = message;
+    }
+
+    function showLoading(message) {
+        loadingMessageDiv.textContent = message;
+    }
+
+    function parseAmount(text) {
+        const normalized = String(text)
+            .replaceAll(",", "")
+            .replaceAll("원", "")
+            .replace(/\s+/g, "")
+            .trim();
+
+        const value = Number(normalized);
+        if (!Number.isFinite(value)) {
+            throw new Error(`거래금액을 해석할 수 없습니다: ${text}`);
+        }
+
+        return value;
+    }
+
+    function normalizeWhitespace(text) {
+        return String(text).replace(/\s+/g, " ").trim();
+    }
+
+    function isDateTimeStart(text) {
+        return /^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/.test(text);
+    }
+
+    function isNoiseLine(text) {
+        return (
+            text.startsWith("거래내역서") ||
+            text.startsWith("예금주 ") ||
+            text.startsWith("계좌번호 ") ||
+            text.startsWith("예금종류 ") ||
+            text.startsWith("조회기간 ") ||
+            text.startsWith("본 확인서는") ||
+            text.startsWith("단위: 원") ||
+            text.startsWith("거래일자 구분 거래금액") ||
+            text.startsWith("발급일자 ") ||
+            text.startsWith("발급번호 ") ||
+            text === "1 / 2" ||
+            text === "2 / 2"
+        );
+    }
+
+    function mergeWrappedLines(lines) {
+        const merged = [];
+
+        for (const rawLine of lines) {
+            const line = normalizeWhitespace(rawLine);
+            if (!line || isNoiseLine(line)) {
+                continue;
+            }
+
+            if (merged.length === 0 || isDateTimeStart(line)) {
+                merged.push(line);
+            } else {
+                merged[merged.length - 1] += " " + line;
+            }
+        }
+
+        return merged;
+    }
+
+    function escapeHtml(value) {
+        return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+    }
+</script>
+</body>
+</html>
