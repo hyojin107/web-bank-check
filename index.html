@@ -261,8 +261,10 @@
     }
 
     function parsePdfTransactionLine(line) {
+        const cleanedLine = sanitizePdfLine(line);
+
         const regex = /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+([-\d,]+)\s+([-\d,]+)\s+(.+)$/;
-        const match = line.match(regex);
+        const match = cleanedLine.match(regex);
 
         if (!match) {
             return null;
@@ -447,19 +449,25 @@
     }
 
     function isNoiseLine(text) {
+        const cleaned = sanitizePdfLine(text);
+
+        if (!cleaned) {
+            return true;
+        }
+
         return (
-            text.startsWith("거래내역서") ||
-            text.startsWith("예금주 ") ||
-            text.startsWith("계좌번호 ") ||
-            text.startsWith("예금종류 ") ||
-            text.startsWith("조회기간 ") ||
-            text.startsWith("본 확인서는") ||
-            text.startsWith("단위: 원") ||
-            text.startsWith("거래일자 구분 거래금액") ||
-            text.startsWith("발급일자 ") ||
-            text.startsWith("발급번호 ") ||
-            text === "1 / 2" ||
-            text === "2 / 2"
+            cleaned.startsWith("거래내역서") ||
+            cleaned.startsWith("예금주 ") ||
+            cleaned.startsWith("계좌번호 ") ||
+            cleaned.startsWith("예금종류 ") ||
+            cleaned.startsWith("조회기간 ") ||
+            cleaned.startsWith("본 확인서는") ||
+            cleaned.startsWith("단위: 원") ||
+            cleaned.startsWith("거래일자 구분 거래금액") ||
+            cleaned.startsWith("발급일자 ") ||
+            cleaned.startsWith("발급번호 ") ||
+            cleaned.startsWith("문서 진위확인 ") ||
+            cleaned.startsWith("고객센터 ")
         );
     }
 
@@ -467,16 +475,36 @@
         const merged = [];
 
         for (const rawLine of lines) {
-            const line = normalizeWhitespace(rawLine);
+            const line = sanitizePdfLine(rawLine);
+
             if (!line || isNoiseLine(line)) {
                 continue;
             }
 
-            if (merged.length === 0 || isDateTimeStart(line)) {
+            if (merged.length === 0) {
                 merged.push(line);
-            } else {
-                merged[merged.length - 1] += " " + line;
+                continue;
             }
+
+            // 새 거래 시작
+            if (isDateTimeStart(line)) {
+                merged.push(line);
+                continue;
+            }
+
+            // 이전 줄이 거래행처럼 끝났으면, 현재 줄은 붙이지 않고 무시
+            // (페이지 번호/푸터/잔여 잡음이 섞이는 것 방지)
+            const previous = merged[merged.length - 1];
+            const previousLooksCompleteTransaction =
+                /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s+([-\d,]+)\s+([-\d,]+)\s+(.+)$/.test(previous);
+
+            if (previousLooksCompleteTransaction) {
+                continue;
+            }
+
+            // 이전 줄이 미완성 거래행일 때만 continuation 으로 붙임
+            merged[merged.length - 1] += " " + line;
+            merged[merged.length - 1] = normalizeWhitespace(merged[merged.length - 1]);
         }
 
         return merged;
@@ -489,6 +517,34 @@
             .replaceAll(">", "&gt;")
             .replaceAll('"', "&quot;")
             .replaceAll("'", "&#039;");
+    }
+
+    function stripPageMarkers(text) {
+        return String(text)
+            // "1 / 2", "2/2" 같은 페이지 번호 제거
+            .replace(/\b\d+\s*\/\s*\d+\b/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+    }
+
+    function stripFooterNoise(text) {
+        let cleaned = String(text);
+
+        // 발급/고객센터/검증 URL 뒤쪽 제거
+        cleaned = cleaned.replace(/발급일자\s+\d{4}년.*$/g, "").trim();
+        cleaned = cleaned.replace(/발급번호\s+.*$/g, "").trim();
+        cleaned = cleaned.replace(/문서\s*진위확인\s+https?:\/\/\S+/g, "").trim();
+        cleaned = cleaned.replace(/고객센터\s+\d{4}-\d{4}/g, "").trim();
+
+        return cleaned;
+    }
+
+    function sanitizePdfLine(text) {
+        let cleaned = normalizeWhitespace(text);
+        cleaned = stripFooterNoise(cleaned);
+        cleaned = stripPageMarkers(cleaned);
+        cleaned = normalizeWhitespace(cleaned);
+        return cleaned;
     }
 </script>
 </body>
